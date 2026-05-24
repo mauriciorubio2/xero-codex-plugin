@@ -1,6 +1,6 @@
 {
   "name": "xero",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Connect Codex to Xero for accounting data, reports, guarded writes, exports, analysis, and charts.",
   "author": {
     "name": "Mauricio Rubio",

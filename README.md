@@ -28,7 +28,7 @@ It gives Codex a local helper for Xero Accounting API reads, guarded writes, exp
 From a local checkout:
 
 ```bash
-codex plugin marketplace add /Users/mauriciorubio/Documents/xero-codex-plugin
+codex plugin marketplace add /path/to/xero-codex-plugin
 codex plugin add xero@xero-codex-plugin
 ```
 

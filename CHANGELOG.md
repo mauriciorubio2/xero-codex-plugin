@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 - 2026-05-25
+
+- Fixed the local checkout install example to use a generic path instead of a maintainer-specific filesystem path.
+
 ## 0.1.0 - 2026-05-25
 
 Initial experimental release of the Xero Codex Plugin.
