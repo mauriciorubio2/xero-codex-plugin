@@ -6,14 +6,18 @@ import base64
 import csv
 import datetime as dt
 import decimal
+import getpass
 import hashlib
 import html
 import http.server
 import json
 import os
 from pathlib import Path
+import re
 import secrets
+import shutil
 import socketserver
+import subprocess
 import sys
 import time
 from typing import Any
@@ -79,6 +83,22 @@ REPORT_DEFS: dict[str, str] = {
 }
 
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+KEYCHAIN_SERVICE = "codex-xero"
+PLAINTEXT_TOKEN_ENV = "XERO_CODEX_ALLOW_PLAINTEXT_TOKENS"
+DEFAULT_EXPORT_PASSPHRASE_ENV = "XERO_CODEX_EXPORT_PASSPHRASE"
+SENSITIVE_KEYS = {
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "authorization",
+    "client_secret",
+    "client_secret_env",
+    "code",
+    "code_verifier",
+    "password",
+    "secret",
+    "token",
+}
 Decimal = decimal.Decimal
 
 
@@ -118,6 +138,111 @@ def save_config(path: Path, payload: dict[str, Any]) -> None:
         pass
 
 
+def keychain_available() -> bool:
+    return sys.platform == "darwin" and shutil.which("security") is not None
+
+
+def keychain_account(profile_name: str) -> str:
+    return f"codex-xero:{profile_name}"
+
+
+def keychain_get_secret(account: str) -> str | None:
+    if not keychain_available():
+        return None
+    result = subprocess.run(
+        ["security", "find-generic-password", "-a", account, "-s", KEYCHAIN_SERVICE, "-w"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode == 0:
+        return result.stdout
+    if result.returncode in {44, 45, 50} or "could not be found" in result.stderr.lower():
+        return None
+    raise XeroCliError(f"Could not read token from macOS Keychain: {result.stderr.strip()}")
+
+
+def keychain_set_secret(account: str, secret: str) -> None:
+    if not keychain_available():
+        raise XeroCliError("macOS Keychain is not available")
+    result = subprocess.run(
+        ["security", "add-generic-password", "-a", account, "-s", KEYCHAIN_SERVICE, "-w", secret, "-U"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise XeroCliError(f"Could not store token in macOS Keychain: {result.stderr.strip()}")
+
+
+def keychain_delete_secret(account: str) -> None:
+    if not keychain_available():
+        return
+    subprocess.run(
+        ["security", "delete-generic-password", "-a", account, "-s", KEYCHAIN_SERVICE],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def plaintext_tokens_allowed() -> bool:
+    return os.environ.get(PLAINTEXT_TOKEN_ENV) == "1"
+
+
+def load_token(profile_name: str, profile: dict[str, Any]) -> dict[str, Any] | None:
+    stored = keychain_get_secret(keychain_account(profile_name))
+    if stored:
+        try:
+            token = json.loads(stored)
+        except json.JSONDecodeError as exc:
+            raise XeroCliError(f"Stored token for profile '{profile_name}' is not valid JSON") from exc
+        if isinstance(token, dict):
+            return token
+    legacy_token = profile.get("token")
+    if isinstance(legacy_token, dict):
+        return legacy_token
+    return None
+
+
+def store_token(profile_name: str, profile: dict[str, Any], token: dict[str, Any]) -> str:
+    if keychain_available():
+        keychain_set_secret(keychain_account(profile_name), json.dumps(token, sort_keys=True, default=str))
+        profile.pop("token", None)
+        profile["token_store"] = "macos-keychain"
+    elif plaintext_tokens_allowed():
+        profile["token"] = token
+        profile["token_store"] = "plaintext-config"
+    else:
+        raise XeroCliError(
+            "No secure token store is available. On macOS this helper uses Keychain. "
+            f"For temporary development-only plaintext token storage, set {PLAINTEXT_TOKEN_ENV}=1."
+        )
+    profile["token_expires_at"] = token.get("expires_at")
+    if token.get("scope"):
+        profile["token_scope"] = token.get("scope")
+    return str(profile["token_store"])
+
+
+def delete_stored_token(profile_name: str, profile: dict[str, Any]) -> None:
+    keychain_delete_secret(keychain_account(profile_name))
+    profile.pop("token", None)
+    profile.pop("token_store", None)
+    profile.pop("token_expires_at", None)
+    profile.pop("token_scope", None)
+
+
+def migrate_legacy_token(profile_name: str, profile: dict[str, Any]) -> bool:
+    legacy_token = profile.get("token")
+    if isinstance(legacy_token, dict) and keychain_available():
+        store_token(profile_name, profile, legacy_token)
+        return True
+    return False
+
+
 def get_profile(config: dict[str, Any], name: str, create: bool = False) -> dict[str, Any]:
     profiles = config.setdefault("profiles", {})
     if name not in profiles:
@@ -137,6 +262,62 @@ def emit(payload: Any, as_json: bool = False) -> None:
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
     else:
         print(payload)
+
+
+def redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if lowered in SENSITIVE_KEYS or lowered.endswith("_token") or "secret" in lowered or "password" in lowered:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = redact_sensitive(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_sensitive(item) for item in value]
+    return value
+
+
+def sanitize_error_body(body: str) -> str:
+    text = body
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        payload = None
+    if payload is not None:
+        text = json.dumps(redact_sensitive(payload), sort_keys=True, default=str)
+    text = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
+    text = re.sub(r"(?i)(access_token|refresh_token|id_token|client_secret)=([^&\s]+)", r"\1=<redacted>", text)
+    if len(text) > 2000:
+        text = text[:2000] + "...<truncated>"
+    return text
+
+
+def payload_summary(payload: Any) -> dict[str, Any] | None:
+    if payload is None:
+        return None
+    serialized = json.dumps(payload, sort_keys=True, default=str)
+    summary: dict[str, Any] = {
+        "bytes": len(serialized.encode("utf-8")),
+        "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+    }
+    if isinstance(payload, dict):
+        summary["top_level_keys"] = sorted(str(key) for key in payload.keys())
+        summary["collection_counts"] = {
+            str(key): len(value) for key, value in payload.items() if isinstance(value, list)
+        }
+    elif isinstance(payload, list):
+        summary["items"] = len(payload)
+    return summary
+
+
+def safe_stdout_suppressed(kind: str, out_hint: str = "--out <path>") -> dict[str, Any]:
+    return {
+        "stdout_suppressed": True,
+        "reason": f"{kind} can contain sensitive Xero financial data.",
+        "next_step": f"Write to a protected file with {out_hint}, or explicitly use --unsafe-stdout.",
+    }
 
 
 def parse_scopes(values: list[str] | None, include_write: bool = False) -> list[str]:
@@ -199,7 +380,7 @@ def http_json_request(
             raw = response.read()
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
-        raise XeroCliError(f"Xero API returned HTTP {exc.code}: {error_body}") from exc
+        raise XeroCliError(f"Xero API returned HTTP {exc.code}: {sanitize_error_body(error_body)}") from exc
     except urllib.error.URLError as exc:
         raise XeroCliError(f"Could not reach Xero API: {exc}") from exc
     if not raw:
@@ -229,8 +410,8 @@ def exchange_code_for_token(
     return normalize_token(token)
 
 
-def refresh_access_token(profile: dict[str, Any]) -> dict[str, Any]:
-    token = profile.get("token") or {}
+def refresh_access_token(profile_name: str, profile: dict[str, Any]) -> dict[str, Any]:
+    token = load_token(profile_name, profile) or {}
     refresh_token = token.get("refresh_token")
     client_id = profile.get("client_id")
     if not refresh_token or not client_id:
@@ -241,8 +422,9 @@ def refresh_access_token(profile: dict[str, Any]) -> dict[str, Any]:
         form["client_id"] = client_id
     body = urllib.parse.urlencode(form).encode("utf-8")
     refreshed = http_json_request("POST", TOKEN_URL, headers=token_headers(client_id, client_secret), body=body)
-    profile["token"] = normalize_token(refreshed)
-    return profile["token"]
+    normalized = normalize_token(refreshed)
+    store_token(profile_name, profile, normalized)
+    return normalized
 
 
 def normalize_token(token: dict[str, Any]) -> dict[str, Any]:
@@ -254,8 +436,8 @@ def normalize_token(token: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def token_expired(profile: dict[str, Any]) -> bool:
-    token = profile.get("token") or {}
+def token_expired(token: dict[str, Any] | None) -> bool:
+    token = token or {}
     expires_at = int(token.get("expires_at", 0) or 0)
     return expires_at <= int(time.time())
 
@@ -326,14 +508,14 @@ def xero_connections(access_token: str) -> list[dict[str, Any]]:
     return payload
 
 
-def ensure_token(profile: dict[str, Any], config_path: Path, config: dict[str, Any]) -> str:
-    token = profile.get("token") or {}
+def ensure_token(profile_name: str, profile: dict[str, Any], config_path: Path, config: dict[str, Any]) -> str:
+    token = load_token(profile_name, profile) or {}
     if not token.get("access_token"):
         raise XeroCliError("Profile is not connected. Run auth login first.")
-    if token_expired(profile):
-        refresh_access_token(profile)
+    if token_expired(token):
+        token = refresh_access_token(profile_name, profile)
         save_config(config_path, config)
-    return str(profile["token"]["access_token"])
+    return str(token["access_token"])
 
 
 def active_tenant_id(profile: dict[str, Any], requested: str | None = None) -> str:
@@ -360,6 +542,7 @@ def build_api_url(path: str, params: dict[str, str | int | None] | None = None) 
 
 
 def api_request(
+    profile_name: str,
     profile: dict[str, Any],
     config: dict[str, Any],
     config_path: Path,
@@ -371,6 +554,7 @@ def api_request(
     payload: Any = None,
     idempotency_key: str | None = None,
     dry_run: bool = False,
+    include_body: bool = False,
 ) -> Any:
     method = method.upper()
     body = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -383,14 +567,19 @@ def api_request(
     if not path.startswith("http"):
         headers["xero-tenant-id"] = active_tenant_id(profile, tenant_id)
     if dry_run:
-        return {
+        plan = {
             "dry_run": True,
             "method": method,
             "url": url,
             "headers": {key: ("Bearer <redacted>" if key.lower() == "authorization" else value) for key, value in headers.items()},
-            "body": payload,
+            "body_redacted": not include_body,
         }
-    access_token = ensure_token(profile, config_path, config)
+        if include_body:
+            plan["body"] = payload
+        else:
+            plan["body_summary"] = payload_summary(payload)
+        return plan
+    access_token = ensure_token(profile_name, profile, config_path, config)
     headers["Authorization"] = f"Bearer {access_token}"
     return http_json_request(method, url, headers=headers, body=body)
 
@@ -486,6 +675,7 @@ def fetch_resource_records(
         if paged:
             params["page"] = page
         payload = api_request(
+            args.profile,
             profile,
             config,
             config_path,
@@ -522,16 +712,152 @@ def records_to_csv(records: list[dict[str, Any]]) -> str:
     return buffer.getvalue()
 
 
-def write_records(records: list[dict[str, Any]], out: str | None, fmt: str, as_json: bool) -> None:
+def inside_git_worktree(path: Path) -> bool:
+    candidate = path.expanduser().resolve(strict=False)
+    current = candidate if candidate.is_dir() else candidate.parent
+    for parent in [current, *current.parents]:
+        if (parent / ".git").exists():
+            return True
+    return False
+
+
+def guard_sensitive_output_path(path: Path, allow_git_output: bool) -> None:
+    if inside_git_worktree(path) and not allow_git_output:
+        raise XeroCliError(
+            f"Refusing to write sensitive Xero data inside a Git worktree: {path}. "
+            "Choose a private export directory, or pass --allow-git-output if you have checked .gitignore."
+        )
+
+
+def secure_write_text(path_text: str, content: str, *, overwrite: bool = False, allow_git_output: bool = False) -> None:
+    path = Path(path_text).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    guard_sensitive_output_path(path, allow_git_output)
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_TRUNC if overwrite else os.O_EXCL
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise XeroCliError(f"Output file already exists: {path}. Use --overwrite to replace it.") from exc
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def encrypt_text_to_file(
+    path_text: str,
+    content: str,
+    *,
+    passphrase_env: str,
+    overwrite: bool = False,
+    allow_git_output: bool = False,
+) -> None:
+    openssl = shutil.which("openssl")
+    if not openssl:
+        raise XeroCliError("Encrypted exports require openssl on PATH")
+    path = Path(path_text).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    guard_sensitive_output_path(path, allow_git_output)
+    if path.exists() and not overwrite:
+        raise XeroCliError(f"Output file already exists: {path}. Use --overwrite to replace it.")
+    env = dict(os.environ)
+    if not env.get(passphrase_env):
+        env[passphrase_env] = getpass.getpass(f"Passphrase for encrypted export ({passphrase_env}): ")
+    result = subprocess.run(
+        [
+            openssl,
+            "enc",
+            "-aes-256-cbc",
+            "-pbkdf2",
+            "-salt",
+            "-md",
+            "sha256",
+            "-out",
+            str(path),
+            "-pass",
+            f"env:{passphrase_env}",
+        ],
+        input=content.encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise XeroCliError(f"Could not encrypt export: {result.stderr.decode('utf-8', errors='replace').strip()}")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def write_sensitive_text(
+    content: str,
+    out: str | None,
+    *,
+    kind: str,
+    unsafe_stdout: bool = False,
+    encrypt: bool = False,
+    passphrase_env: str = DEFAULT_EXPORT_PASSPHRASE_ENV,
+    overwrite: bool = False,
+    allow_git_output: bool = False,
+) -> None:
+    if out:
+        if encrypt:
+            encrypt_text_to_file(
+                out,
+                content,
+                passphrase_env=passphrase_env,
+                overwrite=overwrite,
+                allow_git_output=allow_git_output,
+            )
+        else:
+            secure_write_text(out, content, overwrite=overwrite, allow_git_output=allow_git_output)
+        emit({"wrote": out, "encrypted": encrypt}, as_json=True)
+        return
+    if unsafe_stdout:
+        print(content, end="" if content.endswith("\n") else "\n")
+        return
+    emit(safe_stdout_suppressed(kind), True)
+
+
+def write_records(
+    records: list[dict[str, Any]],
+    out: str | None,
+    fmt: str,
+    as_json: bool,
+    *,
+    unsafe_stdout: bool = False,
+    encrypt: bool = False,
+    passphrase_env: str = DEFAULT_EXPORT_PASSPHRASE_ENV,
+    overwrite: bool = False,
+    allow_git_output: bool = False,
+) -> None:
     if fmt == "csv" or (out and out.lower().endswith(".csv")):
         content = records_to_csv(records)
     else:
         content = json.dumps(records, indent=2, sort_keys=True, default=str) + "\n"
     if out:
-        Path(out).expanduser().write_text(content, encoding="utf-8")
-        emit({"wrote": out, "records": len(records)}, as_json=True)
-    else:
+        if encrypt:
+            encrypt_text_to_file(
+                out,
+                content,
+                passphrase_env=passphrase_env,
+                overwrite=overwrite,
+                allow_git_output=allow_git_output,
+            )
+        else:
+            secure_write_text(out, content, overwrite=overwrite, allow_git_output=allow_git_output)
+        emit({"wrote": out, "records": len(records), "encrypted": encrypt}, as_json=True)
+    elif unsafe_stdout:
         print(content, end="")
+    else:
+        summary = safe_stdout_suppressed("Resource output")
+        summary["records"] = len(records)
+        emit(summary, True)
 
 
 def decimal_from(value: Any) -> Decimal:
@@ -823,6 +1149,8 @@ def command_auth(args: argparse.Namespace) -> None:
     config_path = Path(args.config).expanduser() if args.config else default_config_path()
     config = load_config(config_path)
     profile = get_profile(config, args.profile, create=args.auth_command in {"configure", "login", "status"})
+    if migrate_legacy_token(args.profile, profile):
+        save_config(config_path, config)
 
     if args.auth_command == "configure":
         scopes = parse_scopes(args.scope, args.write_scopes)
@@ -864,22 +1192,31 @@ def command_auth(args: argparse.Namespace) -> None:
         profile.update({"client_id": client_id, "redirect_uri": redirect_uri, "scopes": scopes})
         if client_secret_env:
             profile["client_secret_env"] = client_secret_env
-        profile["token"] = exchange_code_for_token(client_id, redirect_uri, code, verifier, get_client_secret(profile))
-        profile["tenants"] = xero_connections(profile["token"]["access_token"])
+        token = exchange_code_for_token(client_id, redirect_uri, code, verifier, get_client_secret(profile))
+        profile["tenants"] = xero_connections(token["access_token"])
+        store_token(args.profile, profile, token)
         if profile["tenants"] and not profile.get("active_tenant_id"):
             profile["active_tenant_id"] = profile["tenants"][0].get("tenantId")
         save_config(config_path, config)
-        emit({"connected": args.profile, "tenants": profile.get("tenants", []), "config": str(config_path)}, args.json)
+        emit(
+            {
+                "connected": args.profile,
+                "tenants": profile.get("tenants", []),
+                "config": str(config_path),
+                "token_store": profile.get("token_store"),
+            },
+            args.json,
+        )
         return
 
     if args.auth_command == "refresh":
-        refresh_access_token(profile)
+        token = refresh_access_token(args.profile, profile)
         save_config(config_path, config)
-        emit({"refreshed": args.profile, "expires_at": profile["token"].get("expires_at")}, args.json)
+        emit({"refreshed": args.profile, "expires_at": token.get("expires_at"), "token_store": profile.get("token_store")}, args.json)
         return
 
     if args.auth_command == "tenants":
-        access_token = ensure_token(profile, config_path, config)
+        access_token = ensure_token(args.profile, profile, config_path, config)
         profile["tenants"] = xero_connections(access_token)
         save_config(config_path, config)
         emit(profile["tenants"], True)
@@ -897,15 +1234,19 @@ def command_auth(args: argparse.Namespace) -> None:
         raise XeroCliError(f"No known tenant matched '{args.tenant}'. Run auth tenants first.")
 
     if args.auth_command == "status":
-        token = profile.get("token") or {}
+        token = load_token(args.profile, profile)
+        tenants = profile.get("tenants", [])
         safe = {
             "profile": args.profile,
             "configured": bool(profile.get("client_id")),
-            "connected": bool(token.get("access_token")),
-            "token_expired": token_expired(profile) if token else None,
-            "expires_at": token.get("expires_at"),
+            "connected": bool(token and token.get("access_token")),
+            "token_expired": token_expired(token) if token else None,
+            "expires_at": token.get("expires_at") if token else None,
+            "token_store": profile.get("token_store"),
+            "plaintext_token_in_config": isinstance(profile.get("token"), dict),
             "active_tenant_id": profile.get("active_tenant_id"),
-            "tenants": profile.get("tenants", []),
+            "tenant_count": len(tenants) if isinstance(tenants, list) else 0,
+            "tenants": tenants if getattr(args, "show_tenants", False) else "<suppressed; use --show-tenants>",
             "scopes": profile.get("scopes", []),
             "config": str(config_path),
         }
@@ -915,6 +1256,7 @@ def command_auth(args: argparse.Namespace) -> None:
     if args.auth_command == "disconnect":
         if not args.yes:
             raise XeroCliError("Disconnect removes local Xero tokens. Re-run with --yes to confirm.")
+        delete_stored_token(args.profile, profile)
         config.get("profiles", {}).pop(args.profile, None)
         save_config(config_path, config)
         emit({"disconnected": args.profile}, args.json)
@@ -932,6 +1274,7 @@ def command_request(args: argparse.Namespace) -> None:
     config = load_config(config_path)
     profile = get_profile(config, args.profile)
     result = api_request(
+        args.profile,
         profile,
         config,
         config_path,
@@ -942,12 +1285,24 @@ def command_request(args: argparse.Namespace) -> None:
         payload=payload,
         idempotency_key=args.idempotency_key,
         dry_run=args.dry_run,
+        include_body=args.include_body,
     )
     if args.out:
-        Path(args.out).expanduser().write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-        emit({"wrote": args.out}, True)
-    else:
+        write_sensitive_text(
+            json.dumps(result, indent=2, sort_keys=True, default=str) + "\n",
+            args.out,
+            kind="Request output",
+            encrypt=args.encrypt,
+            passphrase_env=args.passphrase_env,
+            overwrite=args.overwrite,
+            allow_git_output=args.allow_git_output,
+        )
+    elif args.dry_run:
         emit(result, True)
+    elif args.unsafe_stdout:
+        emit(result, True)
+    else:
+        emit(safe_stdout_suppressed("Request output"), True)
 
 
 def command_list(args: argparse.Namespace) -> None:
@@ -955,7 +1310,17 @@ def command_list(args: argparse.Namespace) -> None:
     config = load_config(config_path)
     profile = get_profile(config, args.profile)
     records = fetch_resource_records(args, profile, config, config_path)
-    write_records(records, args.out, args.format, args.json)
+    write_records(
+        records,
+        args.out,
+        args.format,
+        args.json,
+        unsafe_stdout=getattr(args, "unsafe_stdout", False),
+        encrypt=args.encrypt,
+        passphrase_env=args.passphrase_env,
+        overwrite=args.overwrite,
+        allow_git_output=args.allow_git_output,
+    )
 
 
 def command_report(args: argparse.Namespace) -> None:
@@ -972,12 +1337,21 @@ def command_report(args: argparse.Namespace) -> None:
     ):
         if value:
             params[key] = value
-    payload = api_request(profile, config, config_path, "GET", REPORT_DEFS[args.report], tenant_id=args.tenant, params=params)
+    payload = api_request(args.profile, profile, config, config_path, "GET", REPORT_DEFS[args.report], tenant_id=args.tenant, params=params)
     if args.out:
-        Path(args.out).expanduser().write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-        emit({"wrote": args.out}, True)
-    else:
+        write_sensitive_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+            args.out,
+            kind="Report output",
+            encrypt=args.encrypt,
+            passphrase_env=args.passphrase_env,
+            overwrite=args.overwrite,
+            allow_git_output=args.allow_git_output,
+        )
+    elif args.unsafe_stdout:
         emit(payload, True)
+    else:
+        emit(safe_stdout_suppressed("Report output"), True)
 
 
 def command_export(args: argparse.Namespace) -> None:
@@ -1004,9 +1378,10 @@ def command_snapshot(args: argparse.Namespace) -> None:
             all_pages=True,
             param=[],
             tenant=args.tenant,
+            profile=args.profile,
         )
 
-    organisation = api_request(profile, config, config_path, "GET", "Organisation", tenant_id=args.tenant)
+    organisation = api_request(args.profile, profile, config, config_path, "GET", "Organisation", tenant_id=args.tenant)
     invoices = fetch_resource_records(make_args("invoices"), profile, config, config_path)
     accounts = fetch_resource_records(make_args("accounts"), profile, config, config_path)
     bank_transactions = fetch_resource_records(make_args("bank-transactions"), profile, config, config_path)
@@ -1025,22 +1400,59 @@ def command_snapshot(args: argparse.Namespace) -> None:
         "analysis": analysis,
     }
     if args.out:
-        Path(args.out).expanduser().write_text(json.dumps(snapshot, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-        emit({"wrote": args.out, "invoices": len(invoices), "bank_transactions": len(bank_transactions)}, True)
-    else:
+        if args.encrypt:
+            encrypt_text_to_file(
+                args.out,
+                json.dumps(snapshot, indent=2, sort_keys=True, default=str) + "\n",
+                passphrase_env=args.passphrase_env,
+                overwrite=args.overwrite,
+                allow_git_output=args.allow_git_output,
+            )
+        else:
+            secure_write_text(
+                args.out,
+                json.dumps(snapshot, indent=2, sort_keys=True, default=str) + "\n",
+                overwrite=args.overwrite,
+                allow_git_output=args.allow_git_output,
+            )
+        emit(
+            {
+                "wrote": args.out,
+                "encrypted": args.encrypt,
+                "invoices": len(invoices),
+                "bank_transactions": len(bank_transactions),
+            },
+            True,
+        )
+    elif args.unsafe_stdout:
         emit(snapshot, True)
+    else:
+        summary = safe_stdout_suppressed("Snapshot output")
+        summary.update({"invoices": len(invoices), "bank_transactions": len(bank_transactions), "analysis_available": True})
+        emit(summary, True)
 
 
 def command_analyze(args: argparse.Namespace) -> None:
     invoices, existing = load_analysis_input(args.input)
     analysis = existing or analyze_invoices(invoices)
     if args.out:
-        Path(args.out).expanduser().write_text(json.dumps(analysis, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-        emit({"wrote": args.out}, True)
-    elif args.json:
+        write_sensitive_text(
+            json.dumps(analysis, indent=2, sort_keys=True, default=str) + "\n",
+            args.out,
+            kind="Analysis output",
+            encrypt=args.encrypt,
+            passphrase_env=args.passphrase_env,
+            overwrite=args.overwrite,
+            allow_git_output=args.allow_git_output,
+        )
+    elif args.unsafe_stdout and args.json:
         emit(analysis, True)
-    else:
+    elif args.unsafe_stdout:
         print(render_human_analysis(analysis))
+    else:
+        summary = safe_stdout_suppressed("Analysis output")
+        summary.update({"invoice_count": analysis.get("invoice_count"), "overdue_count": analysis.get("overdue_count")})
+        emit(summary, True)
 
 
 def command_chart(args: argparse.Namespace) -> None:
@@ -1049,10 +1461,22 @@ def command_chart(args: argparse.Namespace) -> None:
     series = metric_series(analysis, args.metric)
     svg = svg_chart(series, f"Xero monthly {args.metric}")
     if args.out:
-        Path(args.out).expanduser().write_text(svg, encoding="utf-8")
-        emit({"wrote": args.out, "points": len(series)}, True)
+        write_sensitive_text(
+            svg,
+            args.out,
+            kind="Chart output",
+            encrypt=args.encrypt,
+            passphrase_env=args.passphrase_env,
+            overwrite=args.overwrite,
+            allow_git_output=args.allow_git_output,
+        )
     else:
-        print(svg)
+        if args.unsafe_stdout:
+            print(svg)
+        else:
+            summary = safe_stdout_suppressed("Chart output")
+            summary["points"] = len(series)
+            emit(summary, True)
 
 
 def command_template(args: argparse.Namespace) -> None:
@@ -1078,6 +1502,26 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             default=argparse.SUPPRESS,
             help="Emit JSON when a command has a human-readable default",
+        )
+
+    def add_sensitive_output_options(command_parser: argparse.ArgumentParser, *, stdout: bool = True) -> None:
+        if stdout:
+            command_parser.add_argument(
+                "--unsafe-stdout",
+                action="store_true",
+                help="Print raw Xero data to stdout. Use carefully because terminal logs can leak financial data.",
+            )
+        command_parser.add_argument("--encrypt", action="store_true", help="Encrypt --out with OpenSSL AES-256-CBC/PBKDF2.")
+        command_parser.add_argument(
+            "--passphrase-env",
+            default=DEFAULT_EXPORT_PASSPHRASE_ENV,
+            help=f"Environment variable containing the export passphrase. Defaults to {DEFAULT_EXPORT_PASSPHRASE_ENV}.",
+        )
+        command_parser.add_argument("--overwrite", action="store_true", help="Replace an existing output file.")
+        command_parser.add_argument(
+            "--allow-git-output",
+            action="store_true",
+            help="Allow writing sensitive output inside a Git worktree after checking ignore rules.",
         )
 
     parser = argparse.ArgumentParser(description="Codex helper for Xero OAuth, Accounting API access, exports, and analysis.")
@@ -1112,6 +1556,8 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("refresh", "tenants", "status"):
         sub = auth_sub.add_parser(name)
         add_common_options(sub)
+        if name == "status":
+            sub.add_argument("--show-tenants", action="store_true", help="Include tenant names in status output.")
         sub.set_defaults(func=command_auth)
     select = auth_sub.add_parser("select", help="Select an active Xero tenant by ID or exact name")
     add_common_options(select)
@@ -1132,8 +1578,10 @@ def build_parser() -> argparse.ArgumentParser:
     request.add_argument("--body-file", help="Path to JSON request body")
     request.add_argument("--idempotency-key")
     request.add_argument("--dry-run", action="store_true")
+    request.add_argument("--include-body", action="store_true", help="Include the raw body in dry-run output.")
     request.add_argument("--yes", action="store_true", help="Confirm a write request")
     request.add_argument("--out")
+    add_sensitive_output_options(request)
     request.set_defaults(func=command_request)
 
     listing = subparsers.add_parser("list", help="List a common Xero Accounting API resource")
@@ -1151,6 +1599,7 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--max-pages", type=int, default=100)
     listing.add_argument("--format", choices=["json", "csv"], default="json")
     listing.add_argument("--out")
+    add_sensitive_output_options(listing)
     listing.set_defaults(func=command_list)
 
     report = subparsers.add_parser("report", help="Fetch a common Xero report")
@@ -1164,6 +1613,7 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--timeframe")
     report.add_argument("--param", action="append")
     report.add_argument("--out")
+    add_sensitive_output_options(report)
     report.set_defaults(func=command_report)
 
     export = subparsers.add_parser("export", help="Export a resource to JSON or CSV")
@@ -1180,6 +1630,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--max-pages", type=int, default=100)
     export.add_argument("--format", choices=["json", "csv"], default="json")
     export.add_argument("--out", required=True)
+    add_sensitive_output_options(export, stdout=False)
     export.set_defaults(func=command_export)
 
     snapshot = subparsers.add_parser("snapshot", help="Fetch organisation, accounts, invoices, bank transactions, and analysis")
@@ -1189,12 +1640,14 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--to", dest="to_date")
     snapshot.add_argument("--max-pages", type=int, default=100)
     snapshot.add_argument("--out")
+    add_sensitive_output_options(snapshot)
     snapshot.set_defaults(func=command_snapshot)
 
     analyze = subparsers.add_parser("analyze", help="Analyze exported invoices or a snapshot")
     add_common_options(analyze)
     analyze.add_argument("--input", required=True)
     analyze.add_argument("--out")
+    add_sensitive_output_options(analyze)
     analyze.set_defaults(func=command_analyze)
 
     chart = subparsers.add_parser("chart", help="Generate an SVG chart from exported invoices or a snapshot")
@@ -1202,6 +1655,7 @@ def build_parser() -> argparse.ArgumentParser:
     chart.add_argument("--input", required=True)
     chart.add_argument("--metric", choices=["sales", "bills", "net"], default="sales")
     chart.add_argument("--out")
+    add_sensitive_output_options(chart)
     chart.set_defaults(func=command_chart)
 
     template = subparsers.add_parser("template", help="Print safe starter payloads for common write operations")

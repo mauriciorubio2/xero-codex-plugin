@@ -117,11 +117,115 @@ class XeroCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "invoices.json"
             path.write_text(json.dumps({"Invoices": SAMPLE_INVOICES}), encoding="utf-8")
-            result = self.run_cli("--json", "analyze", "--input", str(path))
+            result = self.run_cli("--json", "analyze", "--input", str(path), "--unsafe-stdout")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["top_customers"][0]["name"], "Northwind")
+
+    def test_analyze_suppresses_sensitive_stdout_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "invoices.json"
+            path.write_text(json.dumps({"Invoices": SAMPLE_INVOICES}), encoding="utf-8")
+            result = self.run_cli("--json", "analyze", "--input", str(path))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["stdout_suppressed"])
+        self.assertNotIn("Northwind", result.stdout)
+
+    def test_dry_run_redacts_body_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / "accounts.json"
+            config_path.write_text(
+                json.dumps({"profiles": {"default": {"active_tenant_id": "tenant-123"}}}),
+                encoding="utf-8",
+            )
+            result = self.run_cli(
+                "request",
+                "--config",
+                str(config_path),
+                "PUT",
+                "Invoices",
+                "--body",
+                '{"Invoices":[{"Contact":{"Name":"Sensitive Customer"}}]}',
+                "--dry-run",
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["body_redacted"])
+        self.assertIn("body_summary", payload)
+        self.assertNotIn("Sensitive Customer", result.stdout)
+
+    def test_secure_write_uses_private_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "export.json"
+            xero_helper.secure_write_text(str(out), '{"ok": true}\n')
+
+            mode = out.stat().st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+
+    def test_sensitive_output_refuses_git_worktree_by_default(self) -> None:
+        out = REPO_ROOT / "accidental-export.json"
+
+        with self.assertRaises(Exception) as context:
+            xero_helper.secure_write_text(str(out), '{"leak": true}\n')
+
+        self.assertIn("Git worktree", str(context.exception))
+
+    def test_store_token_requires_secure_store_or_explicit_plaintext(self) -> None:
+        original_keychain_available = xero_helper.keychain_available
+        original_env = dict(xero_helper.os.environ)
+        try:
+            xero_helper.keychain_available = lambda: False
+            xero_helper.os.environ.pop(xero_helper.PLAINTEXT_TOKEN_ENV, None)
+            with self.assertRaises(Exception) as context:
+                xero_helper.store_token("default", {}, {"access_token": "a", "refresh_token": "r"})
+            self.assertIn("No secure token store", str(context.exception))
+        finally:
+            xero_helper.keychain_available = original_keychain_available
+            xero_helper.os.environ.clear()
+            xero_helper.os.environ.update(original_env)
+
+    def test_encrypted_export_round_trips_with_openssl(self) -> None:
+        openssl = xero_helper.shutil.which("openssl")
+        if not openssl:
+            self.skipTest("openssl is not available")
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "export.xero.enc"
+            env_name = "XERO_CODEX_TEST_PASSPHRASE"
+            original = xero_helper.os.environ.get(env_name)
+            try:
+                xero_helper.os.environ[env_name] = "test-passphrase"
+                xero_helper.encrypt_text_to_file(str(out), "sensitive report\n", passphrase_env=env_name)
+                result = subprocess.run(
+                    [
+                        openssl,
+                        "enc",
+                        "-d",
+                        "-aes-256-cbc",
+                        "-pbkdf2",
+                        "-md",
+                        "sha256",
+                        "-in",
+                        str(out),
+                        "-pass",
+                        f"env:{env_name}",
+                    ],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={**xero_helper.os.environ, env_name: "test-passphrase"},
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "sensitive report\n")
+            finally:
+                if original is None:
+                    xero_helper.os.environ.pop(env_name, None)
+                else:
+                    xero_helper.os.environ[env_name] = original
 
 
 if __name__ == "__main__":

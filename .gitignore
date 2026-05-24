@@ -7,4 +7,11 @@ dist/
 build/
 .env
 exports/
+*.xero.json
+*.xero.csv
+*.xero.enc
+*.xero.svg
+xero-exports/
+secret-*.json
+*-secret.json
 *.log

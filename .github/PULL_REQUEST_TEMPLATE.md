@@ -7,3 +7,4 @@ Briefly explain what changed and why it matters.
 - [ ] I ran `python3 -m unittest discover -s tests`.
 - [ ] I updated docs or skill instructions if behavior changed.
 - [ ] I considered OAuth token, accounting data, and write-safety implications.
+- [ ] I did not weaken stdout suppression, token storage, export permissions, or Git output guards.
