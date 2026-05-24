@@ -1,0 +1,20 @@
+{
+  "name": "xero-codex-plugin",
+  "interface": {
+    "displayName": "Xero Codex Plugin"
+  },
+  "plugins": [
+    {
+      "name": "xero",
+      "source": {
+        "source": "local",
+        "path": "./plugins/xero"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Finance"
+    }
+  ]
+}

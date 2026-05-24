@@ -1,0 +1,154 @@
+# Xero Codex Plugin
+
+Xero is a free, open source Codex plugin for connecting Codex to a Xero organisation through OAuth 2.0.
+
+It gives Codex a local helper for Xero Accounting API reads, guarded writes, exports, reports, invoice trend analysis, overdue stats, top-customer and supplier summaries, and SVG charts.
+
+## What It Can Do
+
+- Connect to Xero with OAuth 2.0 authorization code + PKCE.
+- Store local profiles, refresh tokens, and selected Xero tenants.
+- Read common Accounting API resources: accounts, contacts, invoices, bills, payments, bank transactions, credit notes, purchase orders, quotes, tracking categories, users, and journals.
+- Pull common reports including Profit and Loss, Balance Sheet, Trial Balance, Bank Summary, Aged Receivables, and Aged Payables.
+- Export Xero records to JSON or CSV for analysis.
+- Build accounting snapshots with organisation, accounts, invoices, bank transactions, and invoice analytics.
+- Analyze monthly sales, bills, net invoiced amount, overdue invoices, receivables, payables, top customers, and top suppliers.
+- Generate simple SVG charts from exported Xero data.
+- Prepare safe starter payloads for contacts, invoices, bills, and payments.
+- Perform generic write requests only after an explicit `--yes`, with `--dry-run` available for review.
+
+## Requirements
+
+- A Xero account and access to the organisation you want to connect.
+- A Xero developer app with a localhost redirect URI such as `http://localhost:45009/callback`.
+- The app's client ID. If you use a confidential app, keep the client secret in an environment variable.
+
+## Install
+
+From a local checkout:
+
+```bash
+codex plugin marketplace add /Users/mauriciorubio/Documents/xero-codex-plugin
+codex plugin add xero@xero-codex-plugin
+```
+
+After publishing to GitHub, the install shape is:
+
+```bash
+codex plugin marketplace add https://github.com/mauriciorubio2/xero-codex-plugin.git
+codex plugin add xero@xero-codex-plugin
+```
+
+The marketplace manifest is at `.agents/plugins/marketplace.json`, and the plugin package is at `plugins/xero`.
+
+## Configure
+
+Create a Xero developer app, add `http://localhost:45009/callback` as a redirect URI, then connect:
+
+```bash
+export XERO_CLIENT_ID="your-xero-client-id"
+
+python3 plugins/xero/scripts/xero.py auth login \
+  --client-id "$XERO_CLIENT_ID" \
+  --redirect-uri "http://localhost:45009/callback"
+```
+
+The default scopes are read-oriented: identity, offline access, accounting settings read, contacts read, transactions read, and reports read.
+
+For guarded write workflows, reconnect with write scopes:
+
+```bash
+python3 plugins/xero/scripts/xero.py auth login \
+  --client-id "$XERO_CLIENT_ID" \
+  --redirect-uri "http://localhost:45009/callback" \
+  --write-scopes
+```
+
+If your app has a client secret, keep it out of files:
+
+```bash
+export XERO_CLIENT_SECRET="your-secret"
+python3 plugins/xero/scripts/xero.py auth login \
+  --client-id "$XERO_CLIENT_ID" \
+  --client-secret-env XERO_CLIENT_SECRET
+```
+
+Check status and tenants:
+
+```bash
+python3 plugins/xero/scripts/xero.py auth status --json
+python3 plugins/xero/scripts/xero.py auth tenants --json
+python3 plugins/xero/scripts/xero.py auth select "<tenant-id-or-exact-name>"
+```
+
+## Use
+
+Ask Codex naturally:
+
+- "Connect my Xero account."
+- "Export invoices from last quarter and chart monthly sales."
+- "Show overdue Xero invoices by customer."
+- "Pull the Profit and Loss and Balance Sheet for March."
+- "Prepare a draft Xero invoice payload for this customer."
+
+Use the helper directly:
+
+```bash
+python3 plugins/xero/scripts/xero.py list invoices --all-pages --from 2026-01-01 --to 2026-03-31 --out invoices.json
+python3 plugins/xero/scripts/xero.py export contacts --format csv --out contacts.csv
+python3 plugins/xero/scripts/xero.py report profit-and-loss --from 2026-01-01 --to 2026-03-31 --json
+python3 plugins/xero/scripts/xero.py snapshot --from 2026-01-01 --to 2026-03-31 --out snapshot.json
+python3 plugins/xero/scripts/xero.py analyze --input snapshot.json
+python3 plugins/xero/scripts/xero.py chart --input snapshot.json --metric sales --out monthly-sales.svg
+```
+
+Prepare a write payload and dry-run it:
+
+```bash
+python3 plugins/xero/scripts/xero.py template sales-invoice > draft-invoice.json
+python3 plugins/xero/scripts/xero.py request PUT Invoices --body-file draft-invoice.json --dry-run
+```
+
+Execute only after checking the tenant, endpoint, and payload:
+
+```bash
+python3 plugins/xero/scripts/xero.py request PUT Invoices --body-file draft-invoice.json --yes
+```
+
+## Privacy And Safety
+
+Tokens are stored locally at `~/.config/codex-xero/accounts.json`, or at `XERO_CODEX_CONFIG` if set. The file stores Xero client IDs, selected tenants, OAuth tokens, scopes, and non-secret profile settings.
+
+Do not store Xero client secrets in this file. Use `--client-secret-env` and an environment variable.
+
+This plugin does not include telemetry. Xero data is financial data, so exports should be treated as sensitive files.
+
+Write requests require `--yes`. Codex should use `--dry-run` first and get explicit user confirmation before creating, updating, deleting, sending, or otherwise changing records in Xero.
+
+## Development
+
+Version history is tracked in [CHANGELOG.md](CHANGELOG.md). This project follows semantic versioning: patch releases for fixes, minor releases for backwards-compatible features, and major releases for breaking changes.
+
+Run the tests with:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Validate the plugin manifest with the Codex plugin creator validator:
+
+```bash
+python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/xero
+```
+
+## Contributing
+
+Contributions are welcome. Please keep changes focused, tested, and aligned with the OAuth-first and confirmation-first design of this plugin.
+
+When you open a PR, include an elevator pitch or short summary at the top that explains what changed and why.
+
+Good PRs should explain user-visible behavior changes, include tests for helper behavior, update docs or skill instructions, avoid unnecessary dependencies, and keep accounting privacy and write safety in mind.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

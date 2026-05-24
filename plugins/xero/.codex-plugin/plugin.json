@@ -1,0 +1,44 @@
+{
+  "name": "xero",
+  "version": "0.1.0",
+  "description": "Connect Codex to Xero for accounting data, reports, guarded writes, exports, analysis, and charts.",
+  "author": {
+    "name": "Mauricio Rubio",
+    "url": "https://github.com/mauriciorubio2"
+  },
+  "homepage": "https://github.com/mauriciorubio2/xero-codex-plugin#readme",
+  "repository": "https://github.com/mauriciorubio2/xero-codex-plugin",
+  "license": "MIT",
+  "keywords": [
+    "xero",
+    "accounting",
+    "finance",
+    "reports",
+    "invoices",
+    "codex",
+    "plugin"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Xero",
+    "shortDescription": "Read, write, export, and analyze Xero accounting data.",
+    "longDescription": "Xero connects Codex to a user's Xero organisation through OAuth 2.0. It supports tenant selection, Accounting API reads, guarded write requests, report pulls, JSON and CSV exports, invoice trend analysis, overdue and contact stats, and SVG chart generation through a bundled dependency-light Python helper.",
+    "developerName": "Mauricio Rubio",
+    "category": "Finance",
+    "capabilities": [
+      "OAuth 2.0",
+      "Read",
+      "Write",
+      "Exports",
+      "Reports",
+      "Financial analysis",
+      "Charts"
+    ],
+    "defaultPrompt": [
+      "Connect my Xero account.",
+      "Export Xero invoices for analysis.",
+      "Chart monthly Xero sales."
+    ],
+    "brandColor": "#13B5EA"
+  }
+}
